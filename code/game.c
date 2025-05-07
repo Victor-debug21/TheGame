@@ -1,6 +1,8 @@
 #include <windows.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdio.h>
+#include <string.h>
 
 #define internal static
 #define local_persist static
@@ -23,6 +25,7 @@ typedef uint64_t uint64;
 
 global_variable bool GlobalRunning;
 global_variable struct win32_offscreen_buffer GlobalBackBuffer;
+global_variable bool ShowDebugInfo = false;
 
 internal struct win32_window_dimension
 Win32GetWindowDimension(HWND Window)
@@ -62,7 +65,8 @@ Win32ResizeDIBSection(struct win32_offscreen_buffer *Buffer, int Width, int Heig
 }
 
 internal void
-Win32GetBufferInWindow(struct win32_offscreen_buffer *Buffer, HDC DeviceContext, int WindowWidth, int WindowHeight)
+Win32GetBufferInWindow(struct win32_offscreen_buffer *Buffer, HDC DeviceContext, int WindowWidth, int WindowHeight,
+                       char *FPSString)
 {
   StretchDIBits(DeviceContext,
 		0, 0, WindowWidth, WindowHeight,
@@ -72,6 +76,13 @@ Win32GetBufferInWindow(struct win32_offscreen_buffer *Buffer, HDC DeviceContext,
 		DIB_RGB_COLORS,
 		SRCCOPY);
 
+  
+  SetBkMode(DeviceContext, TRANSPARENT);
+  SetTextColor(DeviceContext, RGB(255, 255, 0));
+  if(ShowDebugInfo)
+    {
+      TextOutA(DeviceContext, 10, 10, FPSString, (int)strlen(FPSString));
+    }
 }
 
 
@@ -87,6 +98,28 @@ ProcessPlayerInput(HWND Window)
   
 }
 
+
+internal void
+RenderFrameGraphics(struct win32_offscreen_buffer *Buffer, uint8 Red, uint8 Green, uint8 Blue)
+{
+    // Each pixel is 32 bits: 0x00BBGGRR (little-endian)
+    uint8 *Row = (uint8 *)Buffer->Memory;
+
+    for (int Y = 0; Y < Buffer->Height; ++Y)
+    {
+        uint32 *Pixel = (uint32 *)Row;
+        for (int X = 0; X < Buffer->Width; ++X)
+        {
+            uint8 R = Red;
+            uint8 G = Green;
+            uint8 B = Blue;
+
+            *Pixel++ = ((R << 16) | (G << 8) | B); // 0x00RRGGBB
+        }
+
+        Row += Buffer->Pitch;
+    }
+}
 
 
 LRESULT CALLBACK
@@ -113,9 +146,22 @@ Win32MainWindowCallBack(HWND Window,
     case WM_SYSKEYUP:
     case WM_SYSKEYDOWN:
     case WM_KEYDOWN:
+      {
+        uint8 VKCode = (uint8)(WParam & 0xFF);
+        bool IsDown = ((LParam & (1 << 30)) == 0);
+        bool WasDown = ((LParam & (1 << 31)) != 0);
+        if(WasDown != IsDown)
+          {
+            if(VKCode == VK_F10 && IsDown)
+              {
+                ShowDebugInfo = !ShowDebugInfo;
+              }
+          }
+      }
     case WM_KEYUP:
       {
-        uint8 VKCode = WParam;
+        
+        uint8 VKCode = (uint8)(WParam & 0xFF);
         bool IsDown = ((LParam & (1 << 30)) == 0);
         bool WasDown = ((LParam & (1 << 31)) != 0);
         if(WasDown != IsDown)
@@ -156,7 +202,8 @@ Win32MainWindowCallBack(HWND Window,
               }
           }
         
-        int32 AltKeyWasDown = LParam & (1 << 29) != 0;
+        int32 AltKeyWasDown = ((LParam & (1 << 29)) != 0);
+        
         if(VKCode == VK_F4 && AltKeyWasDown)
           {
             OutputDebugStringA("\t\nAltKeyWasDown");
@@ -167,8 +214,9 @@ Win32MainWindowCallBack(HWND Window,
       {
         PAINTSTRUCT Paint;
         HDC DeviceContext = BeginPaint(Window, &Paint);
+        static char FPSBuffer[256] = "FPS: calculating...";
         struct win32_window_dimension Dimension = Win32GetWindowDimension(Window);
-        Win32GetBufferInWindow(&GlobalBackBuffer, DeviceContext, Dimension.Width, Dimension.Height);
+        Win32GetBufferInWindow(&GlobalBackBuffer, DeviceContext, Dimension.Width, Dimension.Height, FPSBuffer);
         EndPaint(Window, &Paint);
       }break;
     default:
@@ -185,12 +233,21 @@ WinMain(HINSTANCE Instance,
         LPSTR CommandLine,
         int ShowCode)
 {
+  (void)PrevInstance;
+  (void)CommandLine;
+  (void)ShowCode;
 
+  LARGE_INTEGER PerformanceFrequency;
+  QueryPerformanceFrequency(&PerformanceFrequency);
+
+  LARGE_INTEGER LastCounter;
+  QueryPerformanceCounter(&LastCounter);
+  
   DWORD Result;
   
   WNDCLASSA WindowClass = {};
-  Win32ResizeDIBSection(&GlobalBackBuffer, 1280, 720);
-  WindowClass.style = CS_HREDRAW|CS_VREDRAW|CS_OWNDC;
+  Win32ResizeDIBSection(&GlobalBackBuffer, 1920, 1080);
+  WindowClass.style = 0;
   WindowClass.lpfnWndProc = Win32MainWindowCallBack;
   WindowClass.hInstance = Instance;
   //  WindowClass.hIcon;
@@ -204,8 +261,8 @@ WinMain(HINSTANCE Instance,
                                     WS_OVERLAPPEDWINDOW|WS_VISIBLE,
                                     CW_USEDEFAULT,
                                     CW_USEDEFAULT,
-                                    CW_USEDEFAULT,
-                                    CW_USEDEFAULT,
+                                    1920,
+                                    1080,
                                     0,
                                     0,
                                     Instance,
@@ -213,8 +270,14 @@ WinMain(HINSTANCE Instance,
       
       if(Window)
         {
+          
+          SetWindowLongA(Window, GWL_STYLE, WS_VISIBLE|WS_POPUP);
+          SetWindowPos(Window, HWND_TOP, 0, 0, GetSystemMetrics(SM_CXSCREEN),
+                       GetSystemMetrics(SM_CYSCREEN), SWP_FRAMECHANGED | SWP_SHOWWINDOW);
+          
           HDC DeviceContext = GetDC(Window);
           GlobalRunning = true;
+          
           while(GlobalRunning)
             {
               MSG Message = {0};
@@ -228,13 +291,42 @@ WinMain(HINSTANCE Instance,
                   DispatchMessageA(&Message);
                 }
 
+              ProcessPlayerInput(Window);
+
+              float FPS = 0.0f;
+              static float FPSDisplayTimer = 0.0f;
+              static int FrameCounter = 0;
+              static char FPSBuffer[256] = "FPS: calculating...";
+
+              struct win32_window_dimension Dimension = Win32GetWindowDimension(Window);
+              Win32GetBufferInWindow(&GlobalBackBuffer, DeviceContext, Dimension.Width, Dimension.Height, FPSBuffer);
+              RenderFrameGraphics(&GlobalBackBuffer, 51, 204, 204);
               //Dont worry we are gonna change that Sleep and CPU was too much for a blank loop.
-              //It was using almost (Ryzen 5 5600x) 1 threat almost %100 percent so this was ridiculous
+              //It was using (Ryzen 5 5600x) 1 threat almost %100 percent so this was ridiculous
               //And we just decrease that percent with sleep function
               Sleep(1);
-              ProcessPlayerInput(Window);
-              struct win32_window_dimension Dimension = Win32GetWindowDimension(Window);
-              Win32GetBufferInWindow(&GlobalBackBuffer, DeviceContext, Dimension.Width, Dimension.Height);
+
+              
+              LARGE_INTEGER EndCounter;
+              QueryPerformanceCounter(&EndCounter);
+
+              uint64 CounterElapsed = EndCounter.QuadPart - LastCounter.QuadPart;
+              float SecondsElapsed = (float)CounterElapsed / (float)PerformanceFrequency.QuadPart;
+
+              FPSDisplayTimer += SecondsElapsed;
+              FrameCounter++;
+
+              if(FPSDisplayTimer >= 0.5f)
+                {
+                  FPS = (float)FrameCounter / FPSDisplayTimer;
+                  sprintf_s(FPSBuffer, sizeof(FPSBuffer), "FPS: %.2f", FPS);
+
+                  FPSDisplayTimer = 0.0f;
+                  FrameCounter = 0;
+                }
+
+              LastCounter = EndCounter;
+
             }
           
         }
@@ -257,3 +349,4 @@ WinMain(HINSTANCE Instance,
  Exit:
   return(0);
 }
+
